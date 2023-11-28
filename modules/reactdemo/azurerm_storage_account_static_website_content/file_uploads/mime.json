@@ -1,0 +1,14 @@
+{
+  ".json": "application/json",
+  ".txt": "text/plain",
+  ".csv": "text/csv",
+  ".png": "image/png",
+  ".css": "text/css",
+  ".js": "text/javascript",
+  ".ttf": "font/ttf",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".jpg": "image/jpg",
+  ".html": "text/html",
+  ".svg": "image/svg+xml"
+}

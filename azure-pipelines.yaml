@@ -1,0 +1,227 @@
+# ---------------------------------------------------------------------------------------------------------------------
+# CI/CD PIPELINE FOR THE INFRASTRUCTURE OF HDFPORTAL
+#
+# This pipeline contains 3 stages:
+# 1. Init   - Initialize terraform remote state
+# 2. Plan   - Validate and plan the infrastructure
+# 3. Deploy - Apply the changes to the infrastructure
+# ---------------------------------------------------------------------------------------------------------------------
+
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+variables:
+  - group: terraform-dev
+
+stages:
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Initalization stage
+#
+# Initialize a resource group with a storage account and a container that will be used as remote state.
+# Terraform needs to store it's state somewhere to keep track of the infrastructure, with this stage we ensure that
+# the remote state will be created.
+# ---------------------------------------------------------------------------------------------------------------------
+
+- stage: Init
+  jobs:
+  - job: InitRemoteState
+    steps:    
+    - script: |
+        chmod +x ./scripts/terraform-init-remote-state.sh
+      displayName: 'Enable script permissions'
+
+    - task: AzureCLI@2
+      name: setVariables
+      displayName: Set Environment Variables
+      continueOnError: false
+      inputs:
+        azureSubscription: $(SPN)
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        inlineScript: |
+          subscriptionId=$(az account show -o json | jq .id | tr -d '"')
+          echo "##vso[task.setvariable variable=AZURE_TENANT_ID;isOutput=true]$tenantId"
+          echo "##vso[task.setvariable variable=AZURE_CLIENT_ID;isOutput=true]$servicePrincipalId"
+          echo "##vso[task.setvariable variable=AZURE_CLIENT_SECRET;isOutput=true]$servicePrincipalKey"
+          echo "##vso[task.setvariable variable=AZURE_SUBSCRIPTION_ID;isOutput=true]$subscriptionId"
+          echo "subscriptionId is $subscriptionId"
+
+    - task: Bash@3
+      inputs:
+        filePath: './scripts/terraform-init-remote-state.sh'
+      displayName: 'Init remote state'
+      env:
+        ARM_SUBSCRIPTION_ID: $(setVariables.AZURE_SUBSCRIPTION_ID)
+        ARM_CLIENT_SECRET: $(setVariables.AZURE_CLIENT_SECRET)
+        ARM_CLIENT_ID: $(setVariables.AZURE_CLIENT_ID)
+        ARM_TENANT_ID: $(setVariables.AZURE_TENANT_ID)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Plan stage
+#
+# In this stage we are performing validation and creating the plan for the infrastrucure, but before we can do that we
+# first need to download terragrunt.
+# ---------------------------------------------------------------------------------------------------------------------
+
+- stage: Plan
+  dependsOn: Init
+  jobs:
+  - job: Plan
+    variables:
+      ARM_SUBSCRIPTION_ID: $[ stageDependencies.Init.InitRemoteState.outputs['setVariables.AZURE_SUBSCRIPTION_ID'] ]
+      ARM_CLIENT_SECRET: $[ stageDependencies.Init.InitRemoteState.outputs['setVariables.AZURE_CLIENT_SECRET'] ]
+      ARM_CLIENT_ID: $[ stageDependencies.Init.InitRemoteState.outputs['setVariables.AZURE_CLIENT_ID'] ]
+      ARM_TENANT_ID: $[ stageDependencies.Init.InitRemoteState.outputs['setVariables.AZURE_TENANT_ID'] ]
+    steps:
+    - template: download-terragrunt.yaml
+
+    - script: terragrunt validate-all --terragrunt-working-dir live
+      displayName: 'Run terragrunt validate-all'
+      env:
+        ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+        ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+        ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+        ARM_TENANT_ID: $(ARM_TENANT_ID)
+
+    - script: chmod +x ./scripts/terragrunt-plan.sh
+      displayName: 'Enable script permissions'
+      
+    - task: Bash@3
+      inputs:
+        filePath: './scripts/terragrunt-plan.sh'
+        arguments: 'plan.log'
+      displayName: 'Run terragrunt plan-all'
+      env:
+        ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+        ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+        ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+        ARM_TENANT_ID: $(ARM_TENANT_ID)
+
+    - task: CopyFiles@2
+      inputs:
+        contents: 'plan.log'
+        targetFolder: $(Build.ArtifactStagingDirectory)
+      displayName: 'Copy plan to artifact staging directory'
+
+    - task: PublishPipelineArtifact@0
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'Plan'
+      displayName: 'Publish Plan Artifact'
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Apply stage
+#
+# In this stage we are applying/deplyoing our changes to the infrastructure. 
+# This stage will only run on the master and develop branches and needs a manual approval.
+# Similarly to the Plan stage we first need to download terragrunt. After that we apply our
+# changes by calling terragrunt apply-all.
+# ---------------------------------------------------------------------------------------------------------------------
+
+- stage: Apply
+  dependsOn: Plan
+  condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/splunknew', 'refs/heads/packer'))
+  variables:
+    environment: 'dev'
+  jobs:
+    - deployment: DeployInfrastructure
+      environment: ${{ variables.environment }}
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: none
+            - checkout: self
+
+            - template: download-terragrunt.yaml
+
+            - script: chmod +x ./scripts/terragrunt-apply.sh
+              displayName: 'Enable script permissions'
+
+            - task: AzureCLI@2
+              name: setVariables
+              displayName: Set Environment Variables
+              continueOnError: false
+              inputs:
+                azureSubscription: $(SPN)
+                scriptType: bash
+                scriptLocation: inlineScript
+                addSpnToEnvironment: true
+                inlineScript: |
+                  subscriptionId=$(az account show -o json | jq .id | tr -d '"')
+                  echo "##vso[task.setvariable variable=AZURE_TENANT_ID;isOutput=true]$tenantId"
+                  echo "##vso[task.setvariable variable=AZURE_CLIENT_ID;isOutput=true]$servicePrincipalId"
+                  echo "##vso[task.setvariable variable=AZURE_CLIENT_SECRET;isOutput=true]$servicePrincipalKey"
+                  echo "##vso[task.setvariable variable=AZURE_SUBSCRIPTION_ID;isOutput=true]$subscriptionId"
+
+            - task: Bash@3
+              inputs:
+                filePath: './scripts/terragrunt-apply.sh'
+                arguments: 'apply.log'
+              displayName: 'Run terragrunt apply-all'
+              env:
+                ARM_SUBSCRIPTION_ID: $(setVariables.AZURE_SUBSCRIPTION_ID)
+                ARM_CLIENT_SECRET: $(setVariables.AZURE_CLIENT_SECRET)
+                ARM_CLIENT_ID: $(setVariables.AZURE_CLIENT_ID)
+                ARM_TENANT_ID: $(setVariables.AZURE_TENANT_ID)
+
+            - task: CopyFiles@2
+              inputs:
+                contents: 'apply.log'
+                targetFolder: $(Build.ArtifactStagingDirectory)
+              displayName: 'Copy apply output to artifact staging directory'
+        
+            - task: PublishPipelineArtifact@0
+              inputs:
+                targetPath: '$(Build.ArtifactStagingDirectory)'
+                ArtifactName: 'Apply'
+              displayName: 'Publish apply artifact'
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Test stage
+#
+# In this stage we are performing testing for the infrastrucure
+# ---------------------------------------------------------------------------------------------------------------------
+
+- stage: Test
+  dependsOn: Apply
+  condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/master', 'refs/heads/splunknew', 'refs/heads/packer'))
+  jobs:
+  - job: Test
+    steps:
+    - task: AzureCLI@2
+      name: getDemoHomePageURL
+      displayName: Set Demo Home Page URL
+      continueOnError: false
+      inputs:
+        azureSubscription: $(SPN)
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        inlineScript: |
+          demoHomeURL=$(az storage account show -n $DEMO_STORAGE_ACCOUNT -g $DEMO_RESOURCE_GROUP --query "primaryEndpoints.web" --output tsv)
+          echo "demoHomeURL is $demoHomeURL"
+          echo "##vso[task.setvariable variable=DEMO_HOME_URL]$demoHomeURL"
+    
+    - script: |
+        echo "DEMO_HOME_URL is $DEMO_HOME_URL"
+        chmod +x ./test/testsigma/cicd-api.sh
+        sed -i "s/{TESTSIGMA_API_KEY}/$(echo $TESTSIGMA_API_KEY)/g" ./test/testsigma/cicd-api.sh
+        sed -i "s/{TESTSIGMA_TEST_PLAN_ID}/$(echo $TESTSIGMA_TEST_PLAN_ID)/g" ./test/testsigma/cicd-api.sh
+        curl -X PUT -H "Content-type: application/json" -H "Accept:application/json" -H "Authorization: Bearer $TESTSIGMA_API_KEY" https://app.testsigma.com/api/v1/environments/$TESTSIGMA_TEST_ENVIRONMENT_ID -d "{\"parameters\": {\"ReactDemoHome\":\"$DEMO_HOME_URL\",\"ReactDemoAccount\":\"$(DEMO_HOME_URL)account\"}}"
+      displayName: 'Prepare Testsigma script'
+    
+    - task: Bash@3
+      inputs:
+        filePath: './test/testsigma/cicd-api.sh'
+      displayName: 'Run Testsigma test'
+
+    - task: PublishTestResults@2
+      displayName: 'Publish Testsigma test results'
+      inputs:
+        testResultsFormat: 'Junit'
+        testResultsFiles: '**/junit-report.xml'
+
